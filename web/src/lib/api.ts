@@ -1,4 +1,4 @@
-const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "";
 
 // Helper: fetch with a generous timeout and clear error messages
 async function apiFetch(
