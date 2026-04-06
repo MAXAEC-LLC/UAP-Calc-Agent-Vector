@@ -1703,12 +1703,9 @@ def _generate_tc201_pdf(data: TC201Data) -> bytes:
     template = PdfReader(TC201_TEMPLATE_PATH)
     writer = PdfWriter()
 
-    # We only fill pages 5 and 6 (indices 4 and 5) — the actual form.
-    # Pages 1-4 are instructions; include them as-is.
-    for i in range(4):
-        writer.add_page(template.pages[i])
+    # Template is 2 pages: page 0 = form page 1, page 1 = form page 2.
 
-    # ── Page 5 overlay (Form page 1) ────────────────────────────────
+    # ── Page 1 overlay (Property ID, occupancy, lease) ──────────────
     overlay5_buf = io.BytesIO()
     c = rl_canvas.Canvas(overlay5_buf, pagesize=letter)
     c.setFont("Helvetica", 9)
@@ -1828,11 +1825,11 @@ def _generate_tc201_pdf(data: TC201Data) -> bytes:
     c.save()
     overlay5_buf.seek(0)
     overlay5 = PdfReader(overlay5_buf)
-    page5 = template.pages[4]
+    page5 = template.pages[0]
     page5.merge_page(overlay5.pages[0])
     writer.add_page(page5)
 
-    # ── Page 6 overlay (Form page 2: Income / Expenses) ─────────────
+    # ── Page 2 overlay (Income / Expenses) ──────────────────────────
     overlay6_buf = io.BytesIO()
     c = rl_canvas.Canvas(overlay6_buf, pagesize=letter)
     c.setFont("Helvetica", 8)
@@ -1916,7 +1913,7 @@ def _generate_tc201_pdf(data: TC201Data) -> bytes:
     c.save()
     overlay6_buf.seek(0)
     overlay6 = PdfReader(overlay6_buf)
-    page6 = template.pages[5]
+    page6 = template.pages[1]
     page6.merge_page(overlay6.pages[0])
     writer.add_page(page6)
 
