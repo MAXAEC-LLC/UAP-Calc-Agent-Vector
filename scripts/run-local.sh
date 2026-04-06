@@ -82,6 +82,7 @@ fi
 
 setsid "$PYTHON" -m uvicorn main:app \
   --host 127.0.0.1 --port "$BACKEND_PORT" --app-dir "${ROOT}/backend" \
+  --timeout-keep-alive 120 \
   > "$LOGFILE_BE" 2>&1 &
 echo $! > "$PIDFILE_BE"
 disown
