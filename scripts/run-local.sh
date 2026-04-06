@@ -55,6 +55,13 @@ if [[ "${1:-}" == "stop" ]]; then
   exit 0
 fi
 
+# ── load .env if present ────────────────────────────────────────────
+if [[ -f "${ROOT}/.env" ]]; then
+  set -a
+  source "${ROOT}/.env"
+  set +a
+fi
+
 # ── resolve ports ───────────────────────────────────────────────────
 BACKEND_PORT="${1:-$(free_port)}"
 FRONTEND_PORT="${2:-$(free_port)}"
@@ -83,7 +90,8 @@ disown
 echo "Starting frontend on http://127.0.0.1:${FRONTEND_PORT} …"
 
 cd "${ROOT}/web"
-NEXT_PUBLIC_API_URL="http://127.0.0.1:${BACKEND_PORT}" \
+NEXT_PUBLIC_API_URL="${NEXT_PUBLIC_API_URL:-}" \
+BACKEND_INTERNAL_URL="http://127.0.0.1:${BACKEND_PORT}" \
   setsid npm run dev -- --hostname 127.0.0.1 --port "$FRONTEND_PORT" \
   > "$LOGFILE_FE" 2>&1 &
 echo $! > "$PIDFILE_FE"

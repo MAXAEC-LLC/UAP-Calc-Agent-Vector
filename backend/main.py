@@ -28,6 +28,7 @@ from property_models import (
 )
 from property_service import property_service
 from property_store import delete_property_context, fetch_property_context, upsert_property_context
+from tc201_models import TC201Data, ResidentialOccupancy, NonresidentialFloor, MiscExpenseItem
 from underwriting_calculator import (
     build_underwriting_calculation_context,
     calculate_underwriting_formula_values,
@@ -94,6 +95,7 @@ openai_client: OpenAI | None = None
 pinecone_client: Pinecone | None = None
 active_index_name: str = PINECONE_INDEX  # mutable — switched via API
 _template_store: dict = {}  # stores uploaded underwriting template bytes
+_tc201_store: dict = {}  # stores parsed TC201 data
 
 # Per-agent tunable settings
 agent_settings: dict = {
@@ -1432,6 +1434,498 @@ async def download_filled_template(req: UnderwritingUpdatesRequest):
     )
 
 
+# ── TC201 – Income & Expense Schedule for Rent-Producing Properties ─────
+
+
+@app.get("/api/tc201")
+async def get_tc201():
+    """Return the currently loaded TC201 data, or a blank template."""
+    if "current" not in _tc201_store:
+        return TC201Data().model_dump()
+    return _tc201_store["current"].model_dump()
+
+
+@app.put("/api/tc201")
+async def update_tc201(data: dict):
+    """Update individual fields of the current TC201 data."""
+    if "current" not in _tc201_store:
+        _tc201_store["current"] = TC201Data()
+
+    current = _tc201_store["current"]
+    current_dict = current.model_dump()
+
+    for key, value in data.items():
+        if key in current_dict:
+            if key == "residential_occupancy" and isinstance(value, list):
+                current_dict[key] = [
+                    ResidentialOccupancy(**r) if isinstance(r, dict) else r for r in value
+                ]
+            elif key == "nonresidential_floors" and isinstance(value, list):
+                current_dict[key] = [
+                    NonresidentialFloor(**f) if isinstance(f, dict) else f for f in value
+                ]
+            elif key == "misc_expenses" and isinstance(value, list):
+                current_dict[key] = [
+                    MiscExpenseItem(**m) if isinstance(m, dict) else m for m in value
+                ]
+            else:
+                current_dict[key] = value
+
+    _tc201_store["current"] = TC201Data(**current_dict)
+    logging.info(f"Updated TC201 data for BBL={_tc201_store['current'].bbl}")
+    return _tc201_store["current"].model_dump()
+
+
+@app.delete("/api/tc201")
+async def clear_tc201():
+    """Clear the current TC201 data."""
+    _tc201_store.pop("current", None)
+    return {"cleared": True}
+
+
+@app.post("/api/tc201/fill-from-property")
+async def fill_tc201_from_property():
+    """Auto-fill TC201 from active property context + uploaded docs via RAG."""
+    property_context = _get_active_property_context()
+
+    primary = None
+    raw: dict = {}
+    property_brief_chunk: str | None = None
+
+    if property_context:
+        primary = property_context.lots_detail[0] if property_context.lots_detail else None
+        raw = primary.raw if primary else {}
+        if property_context.property_brief:
+            property_brief_chunk = f"[Source: NYC Live Property Data]\n{property_context.property_brief}"
+
+    # ── Step 1: Build TC201 from live property data ─────────────────
+    borough_names = {"1": "Manhattan", "2": "Bronx", "3": "Brooklyn", "4": "Queens", "5": "Staten Island"}
+    if property_context:
+        borough_code = property_context.borough or (property_context.primary_bbl[0] if property_context.primary_bbl else "")
+        borough_name = borough_names.get(borough_code, borough_code)
+
+        res_occ: list[ResidentialOccupancy] = []
+        units_res = raw.get("unitsres") or raw.get("residential_units") or property_context.units_total
+        if units_res:
+            res_occ.append(ResidentialOccupancy(
+                occupancy_type="RENTED, REGULATED",
+                number_of_units=int(units_res) if units_res else None,
+            ))
+
+        tc201 = TC201Data(
+            assessment_year="2026/27",
+            borough=borough_name,
+            block=property_context.block,
+            lot=property_context.lots[0] if property_context.lots else "",
+            bbl=property_context.primary_bbl,
+            is_condo="Y" if raw.get("bldg_class", "").startswith("R") else "N",
+            reporting_period_from="01/01/2025",
+            reporting_period_to="12/31/2025",
+            residential_occupancy=res_occ,
+        )
+    else:
+        tc201 = TC201Data()
+
+    # ── Step 2: RAG extraction from uploaded documents ──────────────
+    try:
+        idx = _get_index()
+        stats = idx.describe_index_stats()
+        ns = stats.get("namespaces", {})
+        knowledge_count = ns.get(NAMESPACE_KNOWLEDGE, {}).get("vector_count", 0)
+        logging.info(f"TC201 RAG: index={active_index_name}, namespaces={list(ns.keys())}, knowledge_count={knowledge_count}, has_brief={bool(property_brief_chunk)}")
+
+        if knowledge_count > 0 or property_brief_chunk:
+            query_text = (
+                "income expense schedule rent residential commercial office retail "
+                "fuel wages insurance repairs management water sewer taxes "
+                "net profit loss operating expenses gross income ancillary escalation"
+            )
+            query_embedding = get_embedding(query_text, client=openai_client, embedding_model=EMBEDDING_MODEL)
+
+            source_chunks: list[str] = []
+            if property_brief_chunk:
+                source_chunks.append(property_brief_chunk)
+
+            if knowledge_count > 0:
+                results = idx.query(
+                    vector=query_embedding,
+                    top_k=30,
+                    namespace=NAMESPACE_KNOWLEDGE,
+                    include_metadata=True,
+                )
+                for m in results.get("matches", []):
+                    meta = m.get("metadata", {})
+                    chunk_text = meta.get("text", "")
+                    source_name = meta.get("source", "Unknown")
+                    if chunk_text:
+                        source_chunks.append(f"[Source: {source_name}]\n{chunk_text}")
+                logging.info(f"TC201 RAG: pinecone returned {len(results.get('matches', []))} matches, source_chunks now {len(source_chunks)}")
+
+            if source_chunks:
+                context_text = "\n---\n".join(source_chunks[:20])
+
+                prompt = (
+                    "Extract financial data from these source documents for the NYC TC201 "
+                    "(Income & Expense Schedule for Rent-Producing Properties).\n\n"
+                    "Source documents:\n" + context_text + "\n\n"
+                    "Map the data to these TC201 field names. ONLY return fields you find data for "
+                    "(do NOT return null or empty values).\n\n"
+                    "INCOME fields (Part 6) — use _current suffix for current year, _prior for prior:\n"
+                    "  income_residential_regulated_current, income_residential_unregulated_current,\n"
+                    "  income_residential_subtotal_current, income_office_current, income_retail_current,\n"
+                    "  income_parking_current, income_storage_current, income_other_current,\n"
+                    "  income_other_description, income_subtotal_current,\n"
+                    "  income_operating_escalation_current, income_utility_services_current,\n"
+                    "  income_other_services_current, income_govt_subsidies_current,\n"
+                    "  income_total_gross_current\n\n"
+                    "EXPENSE fields (Part 7) — use _current suffix:\n"
+                    "  expense_fuel_current, expense_light_power_current, expense_cleaning_current,\n"
+                    "  expense_wages_current, expense_repairs_current, expense_management_current,\n"
+                    "  expense_insurance_current, expense_water_sewer_current, expense_advertising_current,\n"
+                    "  expense_painting_current, expense_misc_current,\n"
+                    "  expense_before_taxes_current, expense_real_estate_taxes_current,\n"
+                    "  expense_total_current\n\n"
+                    "NET fields (Part 8):\n"
+                    "  net_before_re_taxes_current, net_after_re_taxes_current\n\n"
+                    "MISC EXPENSES itemization (Part 9):\n"
+                    "  misc_expenses: [{\"item\": \"description\", \"amount\": number}, ...]\n\n"
+                    "Rules:\n"
+                    "- Monthly Maintenance Fee / rent → income_residential_regulated_current or income_residential_unregulated_current\n"
+                    "- Parking income → income_parking_current\n"
+                    "- Insurance expense → expense_insurance_current\n"
+                    "- Management fees → expense_management_current\n"
+                    "- Repairs/maintenance → expense_repairs_current\n"
+                    "- Water/sewer → expense_water_sewer_current\n"
+                    "- Electric/utilities → expense_light_power_current\n"
+                    "- Numbers should be plain (no $ or commas). Use annual totals if available.\n"
+                    "- IMPORTANT: Only include fields you have actual numeric data for.\n"
+                    "- Return ONLY a JSON object with matched fields. Do NOT include null values."
+                )
+
+                sys_msg = (
+                    "You are an expert NYC real estate tax analyst. Extract income and expense "
+                    "numbers from financial documents and map them to TC201 field names. "
+                    "Return ONLY a JSON object containing fields you found data for. "
+                    "Do NOT return fields with null values. Be precise with numbers."
+                )
+
+                try:
+                    response = openai_client.chat.completions.create(
+                        model=GENERATION_MODEL,
+                        temperature=0.1,
+                        messages=[
+                            {"role": "system", "content": sys_msg},
+                            {"role": "user", "content": prompt},
+                        ],
+                        response_format={"type": "json_object"},
+                    )
+                    result_text = response.choices[0].message.content.strip()
+                    logging.info(f"TC201 RAG GPT response (first 500 chars): {result_text[:500]}")
+                    rag_values = json.loads(result_text)
+                    logging.info(f"TC201 RAG parsed {len(rag_values)} keys: {list(rag_values.keys())[:20]}")
+
+                    if isinstance(rag_values, dict):
+                        tc201_dict = tc201.model_dump()
+
+                        for list_key, model_cls in [
+                            ("residential_occupancy", ResidentialOccupancy),
+                            ("nonresidential_floors", NonresidentialFloor),
+                            ("misc_expenses", MiscExpenseItem),
+                        ]:
+                            if list_key in rag_values and isinstance(rag_values[list_key], list):
+                                items = []
+                                for item in rag_values[list_key]:
+                                    if isinstance(item, dict):
+                                        items.append(model_cls(**item))
+                                if items:
+                                    tc201_dict[list_key] = items
+
+                        skip = {"residential_occupancy", "nonresidential_floors", "misc_expenses", "filename", "assessment_year"}
+                        for key, value in rag_values.items():
+                            if key in skip:
+                                continue
+                            if key not in tc201_dict:
+                                continue
+                            if value is None:
+                                continue
+                            current_val = tc201_dict.get(key)
+                            if current_val is None or current_val == "" or current_val == []:
+                                tc201_dict[key] = value
+
+                        tc201 = TC201Data(**tc201_dict)
+                        logging.info(f"TC201 RAG extraction added {len(rag_values)} fields")
+
+                except Exception as e:
+                    logging.warning(f"TC201 RAG extraction failed (non-fatal): {e}")
+
+    except Exception as e:
+        logging.warning(f"TC201 document lookup failed (non-fatal): {e}")
+
+    _tc201_store["current"] = tc201
+    has_property = bool(property_context)
+    logging.info(f"TC201 filled: BBL={tc201.bbl}, property={'yes' if has_property else 'no'}")
+    return tc201.model_dump()
+
+
+@app.get("/api/tc201/download")
+async def download_tc201_pdf():
+    """Generate and download the current TC201 data as a PDF."""
+    if "current" not in _tc201_store:
+        raise HTTPException(status_code=400, detail="No TC201 data to download")
+
+    tc201 = _tc201_store["current"]
+    pdf_bytes = _generate_tc201_pdf(tc201)
+
+    return StreamingResponse(
+        io.BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="TC201_{tc201.bbl or "blank"}_{tc201.assessment_year.replace("/", "-")}.pdf"'},
+    )
+
+
+# ── TC201 PDF fill (overlay text on official form) ──────────────────────
+
+TC201_TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "tc201_template.pdf")
+
+
+def _fmt_currency(val: float | None) -> str:
+    if val is None:
+        return ""
+    return f"${val:,.0f}"
+
+
+def _generate_tc201_pdf(data: TC201Data) -> bytes:
+    """Fill the official TC201 form by overlaying text on the template PDF."""
+    from reportlab.pdfgen import canvas as rl_canvas
+    from reportlab.lib.pagesizes import letter
+    from pypdf import PdfReader, PdfWriter
+
+    template = PdfReader(TC201_TEMPLATE_PATH)
+    writer = PdfWriter()
+
+    # We only fill pages 5 and 6 (indices 4 and 5) — the actual form.
+    # Pages 1-4 are instructions; include them as-is.
+    for i in range(4):
+        writer.add_page(template.pages[i])
+
+    # ── Page 5 overlay (Form page 1) ────────────────────────────────
+    overlay5_buf = io.BytesIO()
+    c = rl_canvas.Canvas(overlay5_buf, pagesize=letter)
+    c.setFont("Helvetica", 9)
+
+    def txt(x, y, val, font_size=9):
+        if val is None or val == "":
+            return
+        c.setFont("Helvetica", font_size)
+        c.drawString(x, y, str(val))
+
+    def txt_r(x, y, val, font_size=9):
+        """Right-aligned text."""
+        if val is None or val == "":
+            return
+        c.setFont("Helvetica", font_size)
+        c.drawRightString(x, y, str(val))
+
+    # Header: YEAR / BOROUGH / BLOCK / LOT / GROUP #
+    txt(93, 745, data.borough)
+    txt(210, 745, data.block)
+    txt(275, 745, data.lot)
+    txt(355, 745, data.tax_commission_group_no)
+
+    # Part 1: Property ID line
+    txt(27, 619, data.borough)
+    txt(230, 619, data.block)
+    txt(330, 619, data.lot)
+    txt(425, 619, data.tax_commission_group_no)
+
+    # Part 1a: Condo Y/N
+    txt(340, 603, data.is_condo)
+    # Part 1b: Multiple lots
+    txt(270, 585, data.covers_multiple_lots)
+    if data.total_lots:
+        txt(390, 585, str(data.total_lots))
+    # Part 1c: Covers entire lot
+    txt(340, 530, data.covers_entire_lot)
+
+    # Part 2: Reporting period
+    txt(155, 477, data.reporting_period_from, 8)
+    txt(260, 477, data.reporting_period_to, 8)
+    # Accounting basis checkmarks
+    if data.accounting_basis.lower().startswith("cash"):
+        txt(492, 477, "✓", 10)
+    elif data.accounting_basis.lower().startswith("accrual"):
+        txt(537, 477, "✓", 10)
+    if data.accounting_basis_changed.upper() == "Y":
+        txt(267, 467, "Y")
+    elif data.accounting_basis_changed.upper() == "N":
+        txt(300, 467, "✓", 10)
+
+    # Part 3: Residential Occupancy
+    occ_types = {
+        "RENTED, REGULATED": 420,
+        "RENTED, UNREGULATED": 403,
+        "OWNER OCCUPIED/SUPER'S APT.": 387,
+        "OWNER OCCUPIED": 387,
+        "VACANT": 370,
+        "TOTAL": 353,
+    }
+    total_units = 0
+    total_rent = 0.0
+    for r in data.residential_occupancy:
+        key = r.occupancy_type.upper().strip()
+        y = None
+        for k, v in occ_types.items():
+            if key.startswith(k[:6]):
+                y = v
+                break
+        if y is None:
+            continue
+        if r.number_of_units is not None:
+            txt_r(350, y, str(r.number_of_units))
+            total_units += r.number_of_units
+        if r.monthly_rent is not None:
+            txt_r(560, y, _fmt_currency(r.monthly_rent))
+            total_rent += r.monthly_rent
+
+    # Total row
+    if total_units:
+        txt_r(350, 353, str(total_units))
+    if total_rent:
+        txt_r(560, 353, _fmt_currency(total_rent))
+
+    # Part 4: Nonresidential Occupancy
+    floor_ys = {
+        "FLOOR 3": 281, "3": 281,
+        "2ND": 264, "2": 264,
+        "1ST": 247, "1": 247,
+        "BASEMENT": 230, "B": 230,
+    }
+    for nf in data.nonresidential_floors:
+        key = nf.floor.upper().strip()
+        y = None
+        for k, v in floor_ys.items():
+            if key.startswith(k):
+                y = v
+                break
+        if y is None:
+            continue
+        if nf.applicant_related_sqft is not None:
+            txt_r(210, y, f"{nf.applicant_related_sqft:,.0f}")
+        if nf.rented_sqft is not None:
+            txt_r(340, y, f"{nf.rented_sqft:,.0f}")
+        if nf.vacant_sqft is not None:
+            txt_r(448, y, f"{nf.vacant_sqft:,.0f}")
+        if nf.gross_sqft is not None:
+            txt_r(558, y, f"{nf.gross_sqft:,.0f}")
+
+    # Part 5: Lease info
+    txt(480, 173, data.entire_lot_leased)
+    txt(27, 124, data.lessor)
+    txt(27, 114, data.lessee)
+    if data.annual_rent is not None:
+        txt(380, 97, _fmt_currency(data.annual_rent))
+
+    c.save()
+    overlay5_buf.seek(0)
+    overlay5 = PdfReader(overlay5_buf)
+    page5 = template.pages[4]
+    page5.merge_page(overlay5.pages[0])
+    writer.add_page(page5)
+
+    # ── Page 6 overlay (Form page 2: Income / Expenses) ─────────────
+    overlay6_buf = io.BytesIO()
+    c = rl_canvas.Canvas(overlay6_buf, pagesize=letter)
+    c.setFont("Helvetica", 8)
+
+    # BBL in header
+    txt(230, 773, f"{data.borough}/{data.block}/{data.lot}", 7)
+
+    # Column positions for prior / current year values
+    PX = 420   # prior year right-align x
+    CX = 555   # current year right-align x
+
+    def row(y, prior_val, current_val):
+        if prior_val is not None:
+            txt_r(PX, y, _fmt_currency(prior_val), 8)
+        if current_val is not None:
+            txt_r(CX, y, _fmt_currency(current_val), 8)
+
+    # Part 6: Income rows (y coords from text extraction)
+    row(753, data.income_residential_regulated_prior, data.income_residential_regulated_current)
+    row(738, data.income_residential_unregulated_prior, data.income_residential_unregulated_current)
+    row(724, data.income_residential_subtotal_prior, data.income_residential_subtotal_current)
+    row(709, data.income_office_prior, data.income_office_current)
+    row(694, data.income_retail_prior, data.income_retail_current)
+    row(679, data.income_loft_prior, data.income_loft_current)
+    row(664, data.income_factory_prior, data.income_factory_current)
+    row(649, data.income_warehouse_prior, data.income_warehouse_current)
+    row(634, data.income_storage_prior, data.income_storage_current)
+    row(619, data.income_parking_prior, data.income_parking_current)
+    row(604, data.income_subtotal_prior, data.income_subtotal_current)
+    row(589, data.income_owner_occupied_prior, data.income_owner_occupied_current)
+    row(574, data.income_operating_escalation_prior, data.income_operating_escalation_current)
+    row(559, data.income_re_tax_escalation_prior, data.income_re_tax_escalation_current)
+    row(544, data.income_utility_services_prior, data.income_utility_services_current)
+    row(530, data.income_other_services_prior, data.income_other_services_current)
+    row(515, data.income_govt_subsidies_prior, data.income_govt_subsidies_current)
+    row(500, data.income_signage_prior, data.income_signage_current)
+    row(485, data.income_cell_towers_prior, data.income_cell_towers_current)
+    row(470, data.income_other_prior, data.income_other_current)
+    row(453, data.income_total_gross_prior, data.income_total_gross_current)
+
+    # Part 7: Expense rows
+    row(424, data.expense_fuel_prior, data.expense_fuel_current)
+    row(409, data.expense_light_power_prior, data.expense_light_power_current)
+    row(394, data.expense_cleaning_prior, data.expense_cleaning_current)
+    row(379, data.expense_wages_prior, data.expense_wages_current)
+    row(364, data.expense_repairs_prior, data.expense_repairs_current)
+    row(349, data.expense_management_prior, data.expense_management_current)
+    row(334, data.expense_insurance_prior, data.expense_insurance_current)
+    row(319, data.expense_water_sewer_prior, data.expense_water_sewer_current)
+    row(304, data.expense_advertising_prior, data.expense_advertising_current)
+    row(289, data.expense_painting_prior, data.expense_painting_current)
+    row(275, data.expense_leasing_ti_prior, data.expense_leasing_ti_current)
+    row(260, data.expense_misc_prior, data.expense_misc_current)
+    row(243, data.expense_before_taxes_prior, data.expense_before_taxes_current)
+    row(228, data.expense_real_estate_taxes_prior, data.expense_real_estate_taxes_current)
+    row(211, data.expense_total_prior, data.expense_total_current)
+
+    # Part 8: Net
+    row(182, data.net_before_re_taxes_prior, data.net_before_re_taxes_current)
+    row(167, data.net_after_re_taxes_prior, data.net_after_re_taxes_current)
+
+    # Part 9: Misc expenses itemization (left column, then right column)
+    misc_y_start = 127
+    misc_y_step = 14
+    for i, m in enumerate(data.misc_expenses[:8]):
+        if i < 4:
+            txt(30, misc_y_start - i * misc_y_step, m.item, 7)
+            if m.amount is not None:
+                txt_r(260, misc_y_start - i * misc_y_step, _fmt_currency(m.amount), 7)
+        else:
+            txt(310, misc_y_start - (i - 4) * misc_y_step, m.item, 7)
+            if m.amount is not None:
+                txt_r(555, misc_y_start - (i - 4) * misc_y_step, _fmt_currency(m.amount), 7)
+
+    # Part 10: Tenants' electricity
+    if data.tenants_electricity_from_applicant:
+        txt(370, 54, data.tenants_electricity_from_applicant)
+    if data.tenants_electricity_separate_charge:
+        txt(370, 40, data.tenants_electricity_separate_charge)
+
+    c.save()
+    overlay6_buf.seek(0)
+    overlay6 = PdfReader(overlay6_buf)
+    page6 = template.pages[5]
+    page6.merge_page(overlay6.pages[0])
+    writer.add_page(page6)
+
+    # Write final PDF
+    output = io.BytesIO()
+    writer.write(output)
+    return output.getvalue()
+
+
 if __name__ == "__main__":
     import uvicorn
 
@@ -1441,3 +1935,4 @@ if __name__ == "__main__":
         port=int(os.getenv("BACKEND_PORT", "8000")),
         reload=True,
     )
+

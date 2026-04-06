@@ -626,3 +626,196 @@ export async function downloadFilledTemplate(
   }
   return res.blob();
 }
+
+// ── TC201 – Income & Expense Schedule ──────────────────────────────────
+
+export interface ResidentialOccupancy {
+  occupancy_type: string;
+  number_of_units: number | null;
+  monthly_rent: number | null;
+}
+
+export interface NonresidentialFloor {
+  floor: string;
+  applicant_related_sqft: number | null;
+  rented_sqft: number | null;
+  vacant_sqft: number | null;
+  gross_sqft: number | null;
+}
+
+export interface MiscExpenseItem {
+  item: string;
+  amount: number | null;
+}
+
+export interface TC201Data {
+  filename: string;
+  assessment_year: string;
+  // Part 1
+  borough: string;
+  block: string;
+  lot: string;
+  bbl: string;
+  tax_commission_group_no: string;
+  is_condo: string;
+  covers_multiple_lots: string;
+  total_lots: number | null;
+  related_lots: string;
+  covers_entire_lot: string;
+  // Part 2
+  reporting_period_from: string;
+  reporting_period_to: string;
+  accounting_basis: string;
+  accounting_basis_changed: string;
+  // Part 3
+  residential_occupancy: ResidentialOccupancy[];
+  rent_includes_recurring_charges: string;
+  // Part 4
+  nonresidential_floors: NonresidentialFloor[];
+  // Part 5
+  entire_lot_leased: string;
+  lease_type: string;
+  applicant_receives_rental_income: string;
+  lessor: string;
+  lessee: string;
+  lease_from: string;
+  lease_to: string;
+  annual_rent: number | null;
+  additional_sums: number | null;
+  lessor_pays_expenses: string;
+  lessor_pays_details: string;
+  land_only_lease: string;
+  // Part 6 - Income
+  income_residential_regulated_prior: number | null;
+  income_residential_regulated_current: number | null;
+  income_residential_unregulated_prior: number | null;
+  income_residential_unregulated_current: number | null;
+  income_residential_subtotal_prior: number | null;
+  income_residential_subtotal_current: number | null;
+  income_office_prior: number | null;
+  income_office_current: number | null;
+  income_retail_prior: number | null;
+  income_retail_current: number | null;
+  income_loft_prior: number | null;
+  income_loft_current: number | null;
+  income_factory_prior: number | null;
+  income_factory_current: number | null;
+  income_warehouse_prior: number | null;
+  income_warehouse_current: number | null;
+  income_storage_prior: number | null;
+  income_storage_current: number | null;
+  income_parking_prior: number | null;
+  income_parking_current: number | null;
+  income_subtotal_prior: number | null;
+  income_subtotal_current: number | null;
+  income_owner_occupied_prior: number | null;
+  income_owner_occupied_current: number | null;
+  income_operating_escalation_prior: number | null;
+  income_operating_escalation_current: number | null;
+  income_re_tax_escalation_prior: number | null;
+  income_re_tax_escalation_current: number | null;
+  income_utility_services_prior: number | null;
+  income_utility_services_current: number | null;
+  income_other_services_prior: number | null;
+  income_other_services_current: number | null;
+  income_govt_subsidies_prior: number | null;
+  income_govt_subsidies_current: number | null;
+  income_signage_prior: number | null;
+  income_signage_current: number | null;
+  income_cell_towers_prior: number | null;
+  income_cell_towers_current: number | null;
+  income_other_prior: number | null;
+  income_other_current: number | null;
+  income_other_description: string;
+  income_total_gross_prior: number | null;
+  income_total_gross_current: number | null;
+  // Part 7 - Expenses
+  expense_fuel_prior: number | null;
+  expense_fuel_current: number | null;
+  expense_light_power_prior: number | null;
+  expense_light_power_current: number | null;
+  expense_cleaning_prior: number | null;
+  expense_cleaning_current: number | null;
+  expense_wages_prior: number | null;
+  expense_wages_current: number | null;
+  expense_repairs_prior: number | null;
+  expense_repairs_current: number | null;
+  expense_management_prior: number | null;
+  expense_management_current: number | null;
+  expense_insurance_prior: number | null;
+  expense_insurance_current: number | null;
+  expense_water_sewer_prior: number | null;
+  expense_water_sewer_current: number | null;
+  expense_advertising_prior: number | null;
+  expense_advertising_current: number | null;
+  expense_painting_prior: number | null;
+  expense_painting_current: number | null;
+  expense_leasing_ti_prior: number | null;
+  expense_leasing_ti_current: number | null;
+  expense_misc_prior: number | null;
+  expense_misc_current: number | null;
+  expense_before_taxes_prior: number | null;
+  expense_before_taxes_current: number | null;
+  expense_real_estate_taxes_prior: number | null;
+  expense_real_estate_taxes_current: number | null;
+  expense_total_prior: number | null;
+  expense_total_current: number | null;
+  // Part 8 - Net
+  net_before_re_taxes_prior: number | null;
+  net_before_re_taxes_current: number | null;
+  net_after_re_taxes_prior: number | null;
+  net_after_re_taxes_current: number | null;
+  // Part 9
+  misc_expenses: MiscExpenseItem[];
+  // Part 10
+  tenants_electricity_from_applicant: string;
+  tenants_electricity_separate_charge: string;
+  notes: string;
+}
+
+export async function getTC201(): Promise<TC201Data | null> {
+  const res = await apiFetch(`${API_BASE}/api/tc201`);
+  if (!res.ok) throw new Error(`Failed to get TC201 (${res.status})`);
+  return res.json();
+}
+
+export async function updateTC201(data: Partial<TC201Data>): Promise<TC201Data> {
+  const res = await apiFetch(`${API_BASE}/api/tc201`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(`TC201 update failed (${res.status}): ${detail}`);
+  }
+  return res.json();
+}
+
+export async function clearTC201(): Promise<{ cleared: boolean }> {
+  const res = await apiFetch(`${API_BASE}/api/tc201`, { method: "DELETE" });
+  if (!res.ok) throw new Error(`Failed to clear TC201 (${res.status})`);
+  return res.json();
+}
+
+export async function fillTC201FromProperty(): Promise<TC201Data> {
+  const res = await apiFetch(
+    `${API_BASE}/api/tc201/fill-from-property`,
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
+    300_000,
+  );
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(`TC201 fill failed (${res.status}): ${detail}`);
+  }
+  return res.json();
+}
+
+export async function downloadTC201PDF(): Promise<Blob> {
+  const res = await apiFetch(`${API_BASE}/api/tc201/download`);
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(`TC201 PDF download failed (${res.status}): ${detail}`);
+  }
+  return res.blob();
+}

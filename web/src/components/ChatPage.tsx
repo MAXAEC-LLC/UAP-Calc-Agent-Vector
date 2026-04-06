@@ -6,6 +6,7 @@ import MessageBubble from "./MessageBubble";
 import Sidebar from "./Sidebar";
 import OnboardingGuide from "./OnboardingGuide";
 import UnderwritingManager from "./UnderwritingManager";
+import TaxAssessmentManager from "./TaxAssessmentManager";
 import type { ChatMessage, PropertyContext } from "@/lib/api";
 import { sendChat } from "@/lib/api";
 
@@ -15,7 +16,7 @@ export default function ChatPage() {
   const [sources, setSources] = useState<{ filename: string; distance: number; source_type?: "property" | "document" }[]>([]);
   const [loading, setLoading] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [mode, setMode] = useState<"chat" | "underwriting">("chat");
+  const [mode, setMode] = useState<"chat" | "underwriting" | "tc201">("chat");
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -153,6 +154,19 @@ export default function ChatPage() {
             >
               Underwriting
             </button>
+            <button
+              onClick={() => setMode("tc201")}
+              style={{
+                padding: "4px 12px",
+                background: mode === "tc201" ? "var(--blue)" : "transparent",
+                border: "1px solid var(--border-color)",
+                color: mode === "tc201" ? "var(--foreground)" : "var(--brand-granite-gray)",
+                cursor: "pointer",
+                fontSize: 12,
+              }}
+            >
+              Tax (TC201)
+            </button>
           </div>
           <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
             {activeProperty && (
@@ -242,8 +256,10 @@ export default function ChatPage() {
             {/* Input */}
             <ChatInput onSend={handleSend} disabled={loading} />
           </>
-        ) : (
+        ) : mode === "underwriting" ? (
           <UnderwritingManager />
+        ) : (
+          <TaxAssessmentManager />
         )}
       </div>
     </div>
