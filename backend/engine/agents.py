@@ -6,6 +6,7 @@ Implements: Librarian, Researcher, Writer, Summarizer.
 import logging
 from .helpers import (
     call_llm_robust,
+    call_llm_stream,
     query_pinecone,
     create_mcp_message,
     helper_sanitize_input,
@@ -67,23 +68,32 @@ def agent_context_librarian(mcp_message, client, index, embedding_model, namespa
 
 # === 2. Researcher Agent ===
 
-def agent_researcher(mcp_message, client, index, generation_model, embedding_model, namespace_knowledge, agent_settings=None, property_context=None):
+def agent_researcher(mcp_message, client, index, generation_model, embedding_model, namespace_knowledge, agent_settings=None, property_context=None, conversation_history=None, embedding_client=None):
     """Performs high-fidelity RAG — queries the knowledge base and synthesizes facts with citations."""
+    emb_client = embedding_client or client
     settings = (agent_settings or {}).get("researcher", {})
-    top_k = settings.get("top_k", 60)
+    top_k = settings.get("top_k", 20)
     temperature = settings.get("temperature", 0.1)
     logging.info(f"[Researcher] Activated. Performing deep research (top_k={top_k}, temp={temperature})...")
     try:
         topic_query = mcp_message["content"].get("topic_query", "")
 
+        # Extract blueprint if provided (merged from Librarian step)
+        blueprint_data = mcp_message["content"].get("blueprint")
+        blueprint_text = ""
+        if isinstance(blueprint_data, dict):
+            blueprint_text = blueprint_data.get("blueprint_json", "")
+        elif isinstance(blueprint_data, str):
+            blueprint_text = blueprint_data
+
         # Sanitize input before embedding
         sanitized_query = helper_sanitize_input(topic_query)
-        helper_moderate_content(sanitized_query, client)
+        helper_moderate_content(sanitized_query, emb_client)
 
         matches = query_pinecone(
             sanitized_query,
             index=index,
-            client=client,
+            client=emb_client,
             embedding_model=embedding_model,
             namespace=namespace_knowledge,
             top_k=top_k,
@@ -123,19 +133,42 @@ def agent_researcher(mcp_message, client, index, generation_model, embedding_mod
 
         combined_context = "\n\n".join(sanitized_chunks)
 
-        # Synthesize answer with citations
-        system_prompt = """You are a research specialist AI for NYC UAP / 485-x building development strategy. Your job is to synthesize information from the provided SOURCE MATERIAL into a comprehensive, citation-backed answer.
+        # Synthesize answer with citations — blueprint is embedded in system prompt
+        blueprint_section = ""
+        if blueprint_text:
+            blueprint_section = f"""
+
+RESPONSE STYLE BLUEPRINT — follow these formatting/style rules:
+{blueprint_text}
+"""
+
+        system_prompt = f"""You are an expert NYC UAP / 485-x building development strategy AI. Your job is to produce a comprehensive, commercially useful answer for a profit-focused developer using ONLY the provided SOURCE MATERIAL.
 
 INSTRUCTIONS:
-1. Answer the user's question thoroughly using ONLY the source material.
+1. Lead with the strongest recommended path, decision, or direct answer.
 2. Cite sources using inline notation like [Source: filename] or [1], [2], etc.
 3. Treat the Active Property Context as the canonical live site data for the current project.
-4. If uploaded documents conflict with the Active Property Context, explicitly call out the conflict instead of silently resolving it.
+4. If uploaded documents conflict with the Active Property Context, explicitly call out the conflict.
 5. Preserve ALL specific data: numbers, percentages, AMI levels, unit counts, FAR values, lot areas, formulas, and tax references.
-6. If the source material cannot answer the question, state that clearly.
-7. Organize your answer with logical structure and keep the reasoning useful for a developer evaluating profitability and feasibility."""
+6. After the recommendation, explain key constraints, risks, missing assumptions, and document conflicts.
+7. Use markdown formatting with readable headers and bullets.
+8. If the source material cannot answer the question, state that clearly.
+9. If the request is outside NYC UAP / 485-x development strategy, say the assistant is domain-locked and redirect.
+10. Do NOT add information beyond what the source material provides.{blueprint_section}"""
 
-        user_prompt = f"""--- USER QUESTION ---
+        # Build conversation context for multi-turn awareness
+        history_block = ""
+        if conversation_history:
+            history_lines = []
+            for msg in conversation_history[-6:]:  # Last 6 messages for context window
+                role = msg.get("role", "user").upper()
+                content = msg.get("content", "")
+                if content.strip():
+                    history_lines.append(f"[{role}]: {content[:500]}")
+            if history_lines:
+                history_block = "\n--- CONVERSATION HISTORY ---\n" + "\n".join(history_lines) + "\n"
+
+        user_prompt = f"""{history_block}--- USER QUESTION ---
 {sanitized_query}
 
 --- SOURCE MATERIAL ({len(sanitized_chunks)} chunks) ---
@@ -161,6 +194,103 @@ Synthesize a comprehensive, citation-backed answer now."""
         raise e
 
 
+def researcher_stream(goal, client, index, generation_model, embedding_model, namespace_knowledge, agent_settings=None, property_context=None, conversation_history=None, blueprint_text="", embedding_client=None):
+    """Streaming variant of agent_researcher. Yields (type, data) tuples:
+       ("sources", sources_list) — emitted once before text starts
+       ("chunk", text_chunk)     — streamed text chunks
+    """
+    emb_client = embedding_client or client
+    settings = (agent_settings or {}).get("researcher", {})
+    top_k = settings.get("top_k", 20)
+    temperature = settings.get("temperature", 0.1)
+    logging.info(f"[Researcher-Stream] Activated (top_k={top_k}, temp={temperature})")
+
+    sanitized_query = helper_sanitize_input(goal)
+    helper_moderate_content(sanitized_query, emb_client)
+
+    matches = query_pinecone(
+        sanitized_query, index=index, client=emb_client,
+        embedding_model=embedding_model, namespace=namespace_knowledge, top_k=top_k,
+    )
+
+    sanitized_chunks = []
+    sources = []
+    chunk_num = 1
+
+    if isinstance(property_context, dict) and property_context.get("property_brief"):
+        property_brief = property_context["property_brief"]
+        property_summary = property_context.get("address") or property_context.get("primary_bbl") or "current site"
+        sanitized_chunks.append(f"[{chunk_num}] (Source: Active Property Context, Score: 1.000):\n{property_brief}")
+        sources.append({"source": f"Active Property Context ({property_summary})", "score": 1.0})
+        chunk_num += 1
+
+    for i, match in enumerate(matches):
+        chunk_text = match.get("metadata", {}).get("text", "")
+        source_name = match.get("metadata", {}).get("source", f"Source_{i+1}")
+        score = match.get("score", 0)
+        try:
+            sanitized_chunk = helper_sanitize_input(chunk_text)
+            sanitized_chunks.append(f"[{chunk_num}] (Source: {source_name}, Score: {score:.3f}):\n{sanitized_chunk}")
+            sources.append({"source": source_name, "score": score})
+            chunk_num += 1
+        except ValueError:
+            continue
+
+    if not sanitized_chunks:
+        yield ("sources", [])
+        yield ("chunk", "No relevant information found in the knowledge base.")
+        return
+
+    combined_context = "\n\n".join(sanitized_chunks)
+
+    blueprint_section = ""
+    if blueprint_text:
+        blueprint_section = f"\n\nRESPONSE STYLE BLUEPRINT — follow these formatting/style rules:\n{blueprint_text}\n"
+
+    system_prompt = f"""You are an expert NYC UAP / 485-x building development strategy AI. Your job is to produce a comprehensive, commercially useful answer for a profit-focused developer using ONLY the provided SOURCE MATERIAL.
+
+INSTRUCTIONS:
+1. Lead with the strongest recommended path, decision, or direct answer.
+2. Cite sources using inline notation like [Source: filename] or [1], [2], etc.
+3. Treat the Active Property Context as the canonical live site data for the current project.
+4. If uploaded documents conflict with the Active Property Context, explicitly call out the conflict.
+5. Preserve ALL specific data: numbers, percentages, AMI levels, unit counts, FAR values, lot areas, formulas, and tax references.
+6. After the recommendation, explain key constraints, risks, missing assumptions, and document conflicts.
+7. Use markdown formatting with readable headers and bullets.
+8. If the source material cannot answer the question, state that clearly.
+9. If the request is outside NYC UAP / 485-x development strategy, say the assistant is domain-locked and redirect.
+10. Do NOT add information beyond what the source material provides.{blueprint_section}"""
+
+    history_block = ""
+    if conversation_history:
+        history_lines = []
+        for msg in conversation_history[-6:]:
+            role = msg.get("role", "user").upper()
+            content = msg.get("content", "")
+            if content.strip():
+                history_lines.append(f"[{role}]: {content[:500]}")
+        if history_lines:
+            history_block = "\n--- CONVERSATION HISTORY ---\n" + "\n".join(history_lines) + "\n"
+
+    user_prompt = f"""{history_block}--- USER QUESTION ---
+{sanitized_query}
+
+--- SOURCE MATERIAL ({len(sanitized_chunks)} chunks) ---
+{combined_context}
+
+Synthesize a comprehensive, citation-backed answer now."""
+
+    # Emit sources first so frontend can display them immediately
+    yield ("sources", sources[:10])
+
+    # Stream the LLM response
+    for text_chunk in call_llm_stream(
+        system_prompt, user_prompt,
+        client=client, generation_model=generation_model, temperature=temperature,
+    ):
+        yield ("chunk", text_chunk)
+
+
 # === 3. Writer Agent ===
 
 def agent_writer(mcp_message, client, generation_model, agent_settings=None):
@@ -179,12 +309,14 @@ def agent_writer(mcp_message, client, generation_model, agent_settings=None):
 
         # Robust handling of multiple data contracts
         facts = None
+        sources = []
         if isinstance(facts_data, dict):
             facts = facts_data.get("facts")
             if facts is None:
                 facts = facts_data.get("summary")
             if facts is None:
                 facts = facts_data.get("answer_with_sources")
+            sources = facts_data.get("sources", [])
         elif isinstance(facts_data, str):
             facts = facts_data
 
@@ -225,7 +357,10 @@ Generate the final content now."""
             generation_model=generation_model,
             temperature=temperature,
         )
-        return create_mcp_message("Writer", final_output)
+        return create_mcp_message("Writer", {
+            "answer_with_sources": final_output,
+            "sources": sources,
+        })
 
     except Exception as e:
         logging.error(f"[Writer] Error: {e}")

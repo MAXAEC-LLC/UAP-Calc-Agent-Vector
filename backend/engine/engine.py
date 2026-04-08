@@ -148,7 +148,7 @@ def resolve_dependencies(input_params, state):
 
 # === Context Engine (Main Entry Point) ===
 
-def context_engine(goal, client, pc, index_name, generation_model, embedding_model, namespace_context, namespace_knowledge, agent_settings=None, property_context=None):
+def context_engine(goal, client, pc, index_name, generation_model, embedding_model, namespace_context, namespace_knowledge, agent_settings=None, property_context=None, conversation_history=None, embedding_client=None):
     """The main entry point for the Context Engine. Manages Planning and Execution."""
     logging.info(f"--- [Context Engine] Starting --- Goal: {goal}")
     trace = ExecutionTrace(goal)
@@ -156,8 +156,13 @@ def context_engine(goal, client, pc, index_name, generation_model, embedding_mod
 
     try:
         index = pc.Index(index_name)
-        capabilities = registry.get_capabilities_description()
-        plan = planner(goal, capabilities, client=client, generation_model=generation_model)
+
+        # Use a hardcoded 2-step pipeline: Librarian retrieves the blueprint,
+        # then Researcher synthesizes facts WITH the blueprint applied (no Writer).
+        plan = [
+            {"step": 1, "agent": "Librarian", "input": {"intent_query": goal}},
+            {"step": 2, "agent": "Researcher", "input": {"topic_query": goal, "blueprint": "$$STEP_1_OUTPUT$$"}},
+        ]
         trace.log_plan(plan)
     except Exception as e:
         trace.finalize(f"Failed during Planning/Init: {e}")
@@ -182,6 +187,8 @@ def context_engine(goal, client, pc, index_name, generation_model, embedding_mod
                 namespace_knowledge=namespace_knowledge,
                 agent_settings=agent_settings,
                 property_context=property_context,
+                conversation_history=conversation_history,
+                embedding_client=embedding_client,
             )
 
             resolved_input = resolve_dependencies(planned_input, state)

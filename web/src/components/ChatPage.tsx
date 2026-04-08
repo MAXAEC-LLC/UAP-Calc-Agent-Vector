@@ -8,7 +8,7 @@ import OnboardingGuide from "./OnboardingGuide";
 import UnderwritingManager from "./UnderwritingManager";
 import TaxAssessmentManager from "./TaxAssessmentManager";
 import type { ChatMessage, PropertyContext } from "@/lib/api";
-import { sendChat } from "@/lib/api";
+import { sendChatStream } from "@/lib/api";
 
 export default function ChatPage() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -47,10 +47,32 @@ export default function ChatPage() {
     setMessages(updated);
     setLoading(true);
 
+    // Add placeholder assistant message for streaming
+    const streamingMessages = [...updated, { role: "assistant" as const, content: "" }];
+    setMessages(streamingMessages);
+
+    let accumulated = "";
+
     try {
-      const res = await sendChat(updated);
-      setMessages([...updated, { role: "assistant", content: res.reply }]);
-      setSources(res.sources);
+      await sendChatStream(
+        updated,
+        (chunk) => {
+          accumulated += chunk;
+          setMessages([...updated, { role: "assistant", content: accumulated }]);
+        },
+        (newSources) => {
+          setSources(newSources);
+        },
+        () => {
+          // done — final state is already set via onChunk
+        },
+        (errorMsg) => {
+          setMessages([
+            ...updated,
+            { role: "assistant", content: `Error: ${errorMsg}` },
+          ]);
+        },
+      );
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : "Unknown error";
       setMessages([

@@ -9,7 +9,7 @@ import re
 import json
 import tiktoken
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from openai import RateLimitError, APITimeoutError, APIConnectionError
+import anthropic
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -19,26 +19,52 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 @retry(
     stop=stop_after_attempt(6),
     wait=wait_exponential(multiplier=1, min=2, max=60),
-    retry=retry_if_exception_type((RateLimitError, APITimeoutError, APIConnectionError)),
+    retry=retry_if_exception_type((anthropic.RateLimitError, anthropic.APITimeoutError, anthropic.APIConnectionError)),
     before_sleep=lambda retry_state: logging.warning(
         f"LLM call failed (attempt {retry_state.attempt_number}). Retrying..."
     ),
 )
 def call_llm_robust(system_prompt, user_prompt, client, generation_model, json_mode=False, temperature=0.1):
-    """Makes a robust, retrying call to the OpenAI Chat Completions API."""
+    """Makes a robust, retrying call to the Anthropic Messages API."""
     kwargs = {
         "model": generation_model,
+        "max_tokens": 16384,
+        "system": system_prompt,
         "messages": [
-            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
         "temperature": temperature,
     }
-    if json_mode:
-        kwargs["response_format"] = {"type": "json_object"}
 
-    response = client.chat.completions.create(**kwargs)
-    return response.choices[0].message.content
+    response = client.messages.create(**kwargs)
+    text = response.content[0].text
+
+    if json_mode:
+        # Strip markdown code fences that Claude may wrap JSON in
+        stripped = text.strip()
+        if stripped.startswith("```"):
+            first_newline = stripped.index("\n") if "\n" in stripped else len(stripped)
+            stripped = stripped[first_newline + 1:]
+            if stripped.rstrip().endswith("```"):
+                stripped = stripped.rstrip()[:-3].rstrip()
+            text = stripped
+
+    return text
+
+
+def call_llm_stream(system_prompt, user_prompt, client, generation_model, temperature=0.1):
+    """Makes a streaming call to the Anthropic Messages API. Yields text chunks."""
+    with client.messages.stream(
+        model=generation_model,
+        max_tokens=16384,
+        system=system_prompt,
+        messages=[
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=temperature,
+    ) as stream:
+        for text in stream.text_stream:
+            yield text
 
 
 # === Embedding Helper ===

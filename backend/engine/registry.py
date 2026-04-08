@@ -17,8 +17,12 @@ class AgentRegistry:
             "Summarizer": agents.agent_summarizer,
         }
 
-    def get_handler(self, agent_name, client, index, generation_model, embedding_model, namespace_context, namespace_knowledge, agent_settings=None, property_context=None):
-        """Returns a callable handler for the given agent, with dependencies pre-bound."""
+    def get_handler(self, agent_name, client, index, generation_model, embedding_model, namespace_context, namespace_knowledge, agent_settings=None, property_context=None, conversation_history=None, embedding_client=None):
+        """Returns a callable handler for the given agent, with dependencies pre-bound.
+        client: Anthropic client for generation
+        embedding_client: OpenAI client for embeddings (falls back to client if not set)
+        """
+        emb_client = embedding_client or client
         handler_func = self.registry.get(agent_name)
         if not handler_func:
             logging.error(f"Agent '{agent_name}' not found in registry.")
@@ -26,7 +30,7 @@ class AgentRegistry:
 
         if agent_name == "Librarian":
             return lambda mcp_message: handler_func(
-                mcp_message, client=client, index=index,
+                mcp_message, client=emb_client, index=index,
                 embedding_model=embedding_model, namespace_context=namespace_context,
                 agent_settings=agent_settings,
             )
@@ -37,6 +41,8 @@ class AgentRegistry:
                 namespace_knowledge=namespace_knowledge,
                 agent_settings=agent_settings,
                 property_context=property_context,
+                conversation_history=conversation_history,
+                embedding_client=emb_client,
             )
         elif agent_name == "Writer":
             return lambda mcp_message: handler_func(

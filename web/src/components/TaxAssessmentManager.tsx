@@ -3,7 +3,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   clearTC201,
-  downloadTC201PDF,
   fillTC201FromProperty,
   getTC201,
   updateTC201,
@@ -12,6 +11,7 @@ import {
   type NonresidentialFloor,
   type MiscExpenseItem,
 } from "@/lib/api";
+import { generateTC201PDF } from "@/lib/fillTC201";
 
 /* ── Formatting helpers ─────────────────────────────────────────────── */
 
@@ -251,10 +251,28 @@ export default function TaxAssessmentManager() {
     finally { setFilling(false); }
   }
 
+  const templateInputRef = useRef<HTMLInputElement>(null);
+  const [uploading, setUploading] = useState(false);
+
+  async function handleUploadTemplate(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploading(true); setError("");
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      const res = await fetch("/api/tc201/upload-template", { method: "POST", body: form });
+      if (!res.ok) throw new Error(await res.text());
+      const json = await res.json();
+      alert(`Template replaced! ${json.pages} pages, ${(json.size / 1024).toFixed(0)} KB`);
+    } catch (err) { setError(err instanceof Error ? err.message : "Template upload failed"); }
+    finally { setUploading(false); if (templateInputRef.current) templateInputRef.current.value = ""; }
+  }
+
   async function handleDownloadPDF() {
     setError("");
     try {
-      const blob = await downloadTC201PDF();
+      const blob = await generateTC201PDF(data);
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
@@ -315,6 +333,11 @@ export default function TaxAssessmentManager() {
             padding: "4px 10px", background: "transparent", border: "1px solid var(--border-color)",
             color: "var(--foreground)", cursor: "pointer", fontSize: 11,
           }}>↓ PDF</button>
+          <input ref={templateInputRef} type="file" accept=".pdf" onChange={handleUploadTemplate} style={{ display: "none" }} />
+          <button onClick={() => templateInputRef.current?.click()} disabled={uploading} style={{
+            padding: "4px 10px", background: "transparent", border: "1px solid var(--border-color)",
+            color: "var(--foreground)", cursor: uploading ? "not-allowed" : "pointer", fontSize: 11,
+          }}>{uploading ? "Uploading..." : "↑ Template"}</button>
           <button onClick={handleClear} style={{
             padding: "4px 10px", background: "transparent", border: "1px solid rgba(238,85,85,0.3)",
             color: "#e55", cursor: "pointer", fontSize: 11,

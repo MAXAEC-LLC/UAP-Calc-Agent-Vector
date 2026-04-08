@@ -61,6 +61,53 @@ export async function sendChat(
   return res.json();
 }
 
+export async function sendChatStream(
+  messages: ChatMessage[],
+  onChunk: (text: string) => void,
+  onSources: (sources: ChatResponse["sources"]) => void,
+  onDone: () => void,
+  onError: (error: string) => void,
+): Promise<void> {
+  const res = await fetch(`${API_BASE}/api/chat/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ messages }),
+  });
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(`Chat failed (${res.status}): ${detail}`);
+  }
+  const reader = res.body?.getReader();
+  if (!reader) throw new Error("No response body");
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      const jsonStr = line.slice(6).trim();
+      if (!jsonStr) continue;
+      try {
+        const event = JSON.parse(jsonStr);
+        if (event.type === "chunk") onChunk(event.text);
+        else if (event.type === "sources") onSources(event.sources);
+        else if (event.type === "done") onDone();
+        else if (event.type === "error") onError(event.message);
+      } catch {
+        // ignore malformed SSE lines
+      }
+    }
+  }
+}
+
 export async function uploadDocument(file: File): Promise<UploadResponse> {
   const form = new FormData();
   form.append("file", file);
