@@ -2369,6 +2369,12 @@ def _generate_tc201_pdf(data: TC201Data) -> bytes:
                 annot_obj = annot.get_object()
                 if annot_obj.get("/T"):
                     all_field_names.add(str(annot_obj["/T"]))
+                # Also collect parent field names (e.g. Borough/Block/Lot use parent-child structure)
+                parent = annot_obj.get("/Parent")
+                if parent:
+                    pobj = parent.get_object() if hasattr(parent, "get_object") else parent
+                    if pobj.get("/T"):
+                        all_field_names.add(str(pobj["/T"]))
     blank_fields = {name: "" for name in all_field_names if name not in fields}
 
     # Write blank fields first (clear residual data), then our filled fields

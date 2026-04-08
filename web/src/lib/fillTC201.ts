@@ -3,7 +3,7 @@
  * Fetches the blank template from the backend, fills AcroForm fields,
  * and returns a downloadable Blob.
  */
-import { PDFDocument } from "pdf-lib";
+import { PDFDocument, StandardFonts } from "pdf-lib";
 import type { TC201Data } from "./api";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "";
@@ -281,6 +281,9 @@ export async function generateTC201PDF(data: TC201Data): Promise<Blob> {
   const form = pdfDoc.getForm();
   const fieldMap = buildFieldMap(data);
 
+  // Embed the same font the template uses (/TiBo = Times-Bold)
+  const timesBold = await pdfDoc.embedFont(StandardFonts.TimesRomanBold);
+
   // Get all field names from the form to blank residual data
   const allFields = form.getFields();
   const allFieldNames = new Set(allFields.map((f) => f.getName()));
@@ -320,6 +323,10 @@ export async function generateTC201PDF(data: TC201Data): Promise<Blob> {
       }
     }
   }
+
+  // Re-generate appearance streams using the correct font (Times-Bold)
+  // so that filled values render with the same typeface as the template.
+  form.updateFieldAppearances(timesBold);
 
   // Flatten so the form appears as printed text
   form.flatten();
